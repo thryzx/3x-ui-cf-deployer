@@ -31,6 +31,7 @@ DB_PATH = "/etc/x-ui/x-ui.db"
 STATE_PATH = "/etc/x-ui/cf_auto_state.json"
 CF_ACCOUNT_PATH = "/etc/x-ui/cf_account.json"
 DEPLOYER_CONFIG_PATH = "/etc/x-ui/cf_deployer_config.json"
+CF_IP_CACHE_PATH = "/etc/x-ui/cf_cloudflare_ips.json"
 PANEL_INFO_PATH = "/etc/x-ui/cf_panel_access.json"
 LAST_LINKS_PATH = os.path.join(os.getcwd(), "cf_auto_last_links.txt")
 PANEL_INFO_SNAPSHOT = os.path.join(os.getcwd(), "cf_panel_last_access.txt")
@@ -39,6 +40,8 @@ DEPLOYER_INSTALL_PATH = "/usr/local/lib/cf-deployer/xui_cf_deployer.py"
 XUI_INSTALL_URL = "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
 XUI_INSTALL_STDIN = "\nn\n4\n\n"
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
+CF_IPS_V4_URL = "https://www.cloudflare.com/ips-v4"
+CF_IPS_V6_URL = "https://www.cloudflare.com/ips-v6"
 DEFAULT_PANEL_URL = "http://127.0.0.1:2053"
 DEFAULT_DEPLOYER_CF_URL = "https://yx-auto.pages.dev"
 DEPLOYER_CF_URL_ENV = "DEPLOYER_CF_URL"
@@ -55,6 +58,30 @@ ORIGIN_RULE_PHASE = "http_request_origin"
 CONFIG_RULE_PHASE = "http_config_settings"
 CF_SUPPORTED_HTTPS_PORTS = [443, 2053, 2083, 2087, 2096, 8443]
 FIREWALL_PANEL_PORTS = [80, 443]
+CF_FALLBACK_IP_RANGES = [
+    "173.245.48.0/20",
+    "103.21.244.0/22",
+    "103.22.200.0/22",
+    "103.31.4.0/22",
+    "141.101.64.0/18",
+    "108.162.192.0/18",
+    "190.93.240.0/20",
+    "188.114.96.0/20",
+    "197.234.240.0/22",
+    "198.41.128.0/17",
+    "162.158.0.0/15",
+    "104.16.0.0/13",
+    "104.24.0.0/14",
+    "172.64.0.0/13",
+    "131.0.72.0/22",
+    "2400:cb00::/32",
+    "2606:4700::/32",
+    "2803:f800::/32",
+    "2405:b500::/32",
+    "2405:8100::/32",
+    "2a06:98c0::/29",
+    "2c0f:f248::/32",
+]
 MANAGED_TAG_RE = re.compile(r"^([0-9a-f]{8})-(vless|trojan|vmess)$", re.I)
 PANEL_API_PREFIX = "panel/api"
 BACKEND_DB = "db"
@@ -804,6 +831,142 @@ def open_firewall_ports_if_active(ports: List[int]) -> None:
         print(
             "No active UFW/firewalld detected. Firewall auto-enable is skipped; "
             f"make sure the cloud security group allows: {', '.join(map(str, unique_ports))}/tcp"
+        )
+
+
+def fetch_text_lines(url: str, timeout: int = 10) -> List[str]:
+    try:
+        with request.urlopen(url, timeout=timeout) as resp:
+            text = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+    return [item.strip() for item in text.split() if item.strip()]
+
+
+def normalize_ip_ranges(ranges: List[str]) -> List[str]:
+    valid_ranges: List[str] = []
+    seen: Set[str] = set()
+    for item in ranges:
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError:
+            continue
+        value = str(network)
+        if value not in seen:
+            valid_ranges.append(value)
+            seen.add(value)
+    return valid_ranges
+
+
+def load_cached_cloudflare_ip_ranges() -> List[str]:
+    try:
+        with open(CF_IP_CACHE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    ranges = payload.get("ranges")
+    if not isinstance(ranges, list):
+        return []
+    return normalize_ip_ranges([str(item) for item in ranges])
+
+
+def save_cached_cloudflare_ip_ranges(ranges: List[str]) -> None:
+    try:
+        parent = os.path.dirname(CF_IP_CACHE_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(CF_IP_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"updated_at": int(time.time()), "ranges": ranges}, f, indent=2)
+        os.chmod(CF_IP_CACHE_PATH, 0o600)
+    except OSError:
+        return
+
+
+def cloudflare_ip_ranges() -> Tuple[List[str], str]:
+    live_ranges = normalize_ip_ranges(fetch_text_lines(CF_IPS_V4_URL) + fetch_text_lines(CF_IPS_V6_URL))
+    if live_ranges:
+        save_cached_cloudflare_ip_ranges(live_ranges)
+        return live_ranges, "official"
+
+    cached_ranges = load_cached_cloudflare_ip_ranges()
+    if cached_ranges:
+        return cached_ranges, "cache"
+
+    fallback_ranges = normalize_ip_ranges(list(CF_FALLBACK_IP_RANGES))
+    if fallback_ranges:
+        return fallback_ranges, "fallback"
+
+    return [], "none"
+
+
+def open_cloudflare_origin_ports_if_active(ports: List[int]) -> None:
+    unique_ports = sorted({int(p) for p in ports if int(p) > 0})
+    if not unique_ports:
+        return
+
+    ranges, source = cloudflare_ip_ranges()
+    if not ranges:
+        print(
+            "Could not load Cloudflare IP ranges. Node port firewall rules were not changed; "
+            f"make sure Cloudflare can reach: {', '.join(map(str, unique_ports))}/tcp"
+        )
+        return
+    if source == "fallback":
+        print(
+            "Using bundled fallback Cloudflare IP ranges because the official list and local cache were unavailable. "
+            "Review firewall rules after network access is restored."
+        )
+
+    opened = False
+    if shutil.which("ufw"):
+        try:
+            status = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            status = None
+        if status and "Status: active" in (status.stdout or ""):
+            added = 0
+            for port in unique_ports:
+                for ip_range in ranges:
+                    if run_firewall_command(["ufw", "allow", "proto", "tcp", "from", ip_range, "to", "any", "port", str(port)]):
+                        added += 1
+            print(
+                "Opened node ports in UFW for Cloudflare IP ranges: "
+                f"{', '.join(map(str, unique_ports))} ({added} rules)"
+            )
+            opened = True
+
+    if shutil.which("firewall-cmd"):
+        try:
+            state = subprocess.run(
+                ["firewall-cmd", "--state"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            state = None
+        if state and state.returncode == 0 and "running" in (state.stdout or ""):
+            added = 0
+            for port in unique_ports:
+                for ip_range in ranges:
+                    family = "ipv6" if ":" in ip_range else "ipv4"
+                    rich_rule = f"rule family={family} source address={ip_range} port port={port} protocol=tcp accept"
+                    if run_firewall_command(["firewall-cmd", "--permanent", "--add-rich-rule", rich_rule]):
+                        added += 1
+            run_firewall_command(["firewall-cmd", "--reload"])
+            print(
+                "Opened node ports in firewalld for Cloudflare IP ranges: "
+                f"{', '.join(map(str, unique_ports))} ({added} rules)"
+            )
+            opened = True
+
+    if not opened:
+        print(
+            "No active UFW/firewalld detected. Firewall auto-enable is skipped; "
+            f"make sure the cloud security group allows Cloudflare to reach: {', '.join(map(str, unique_ports))}/tcp"
         )
 
 
@@ -3191,6 +3354,7 @@ def run_deploy_install(
     managed_dns_record_id = upsert_dns_record(zone_id, domain, public_ip, headers)
     apply_ssl_config_rules(zone_id, headers, [(domain, "flexible", "node")])
     apply_origin_rules(zone_id, headers, domain, routes)
+    open_cloudflare_origin_ports_if_active([int(route["port"]) for route in routes])
 
     links = build_links(user_uuid, domain, routes, deployer_cf_url)
     save_last_links_snapshot(domain=domain, user_uuid=user_uuid, links=links, order=selected_protocols)

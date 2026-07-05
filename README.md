@@ -17,6 +17,7 @@ Main changes in this fork:
 - Added automatic selection of Cloudflare-supported HTTPS panel ports.
 - Added panel certificate issuance through Cloudflare DNS-01 and automatic 3x-ui panel certificate configuration.
 - Added best-effort firewall opening for active UFW/firewalld setups.
+- Added Cloudflare-only firewall rules for generated node ports on active UFW/firewalld setups.
 - Expanded documentation for token permissions, acme.sh token storage, and the security boundary of node `flexible` mode.
 
 `xui_cf_deployer.py` is a Python 3 standard-library-only script for VPS deployment automation:
@@ -55,6 +56,7 @@ Use mode 4 when 3x-ui is not installed. Use mode 1 when 3x-ui is already install
 - Panel access snapshot: `cf_panel_last_access.txt` in the current working directory
 - Panel certificate: `/root/cert/<panel-domain>/`
 - acme.sh renewal config: `/root/.acme.sh/`
+- Cloudflare IP cache: `/etc/x-ui/cf_cloudflare_ips.json`
 - Legacy Cloudflare credential file: `/etc/x-ui/cf_account.json`
 
 The deployer no longer uses `/etc/x-ui/cf_account.json`. If that legacy file exists, the script only warns about it.
@@ -189,6 +191,7 @@ Behavior:
 - Create proxied node DNS.
 - Create node hostname SSL Configuration Rule: `flexible`.
 - Create or merge Origin Rules to route paths to selected local ports.
+- Open generated node ports for Cloudflare IP ranges only when UFW/firewalld is active. The script fetches Cloudflare's official IP list at runtime, caches successful results, and only uses a bundled fallback if both live fetch and cache are unavailable.
 - Output subscription links.
 - Save subscription output to `cf_auto_last_links.txt`.
 
@@ -254,6 +257,7 @@ The WebSocket path is URL-encoded into the `path` parameter.
 - Existing last deployment: use uninstall mode first.
 - Origin Rules quota reached: the script lists rules and lets you delete selected entries.
 - Legacy `/etc/x-ui/cf_account.json`: the script warns about it but does not use it.
+- UFW/firewalld enabled: generated node ports are opened for Cloudflare IP ranges only. Your VPS provider security group must still allow those ports. If the official Cloudflare IP list cannot be fetched, the script uses the last cached list before falling back to its bundled bootstrap list.
 
 ## Security Boundary
 
