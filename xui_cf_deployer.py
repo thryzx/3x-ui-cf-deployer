@@ -32,11 +32,16 @@ STATE_PATH = "/etc/x-ui/cf_auto_state.json"
 CF_ACCOUNT_PATH = "/etc/x-ui/cf_account.json"
 DEPLOYER_CONFIG_PATH = "/etc/x-ui/cf_deployer_config.json"
 CF_IP_CACHE_PATH = "/etc/x-ui/cf_cloudflare_ips.json"
+CF_FIREWALL_STATE_PATH = "/etc/x-ui/cf_firewall_state.json"
 PANEL_INFO_PATH = "/etc/x-ui/cf_panel_access.json"
 LAST_LINKS_PATH = os.path.join(os.getcwd(), "cf_auto_last_links.txt")
 PANEL_INFO_SNAPSHOT = os.path.join(os.getcwd(), "cf_panel_last_access.txt")
 CFD_BIN = "/usr/local/bin/cfd"
 DEPLOYER_INSTALL_PATH = "/usr/local/lib/cf-deployer/xui_cf_deployer.py"
+CF_FIREWALL_SERVICE = "cf-deployer-cloudflare-firewall.service"
+CF_FIREWALL_TIMER = "cf-deployer-cloudflare-firewall.timer"
+CF_FIREWALL_SERVICE_PATH = f"/etc/systemd/system/{CF_FIREWALL_SERVICE}"
+CF_FIREWALL_TIMER_PATH = f"/etc/systemd/system/{CF_FIREWALL_TIMER}"
 XUI_INSTALL_URL = "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
 XUI_INSTALL_STDIN = "\nn\n4\n\n"
 CF_API_BASE = "https://api.cloudflare.com/client/v4"
@@ -782,50 +787,60 @@ def set_panel_certificate(cert_file: str, key_file: str) -> None:
     restart_xui_service()
 
 
-def run_firewall_command(args: List[str]) -> bool:
+def run_firewall_command(args: List[str], *, quiet: bool = False) -> bool:
     try:
         proc = subprocess.run(args, capture_output=True, text=True, timeout=30, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return False
     if proc.returncode != 0:
         output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
-        if output:
+        if output and not quiet:
             print(output[-1000:])
         return False
     return True
 
 
+def ufw_is_active() -> bool:
+    if not shutil.which("ufw"):
+        return False
+    try:
+        status = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "Status: active" in (status.stdout or "")
+
+
+def firewalld_is_active() -> bool:
+    if not shutil.which("firewall-cmd"):
+        return False
+    try:
+        state = subprocess.run(
+            ["firewall-cmd", "--state"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return state.returncode == 0 and "running" in (state.stdout or "")
+
+
 def open_firewall_ports_if_active(ports: List[int]) -> None:
     unique_ports = sorted({int(p) for p in ports if int(p) > 0})
     opened = False
-    if shutil.which("ufw"):
-        try:
-            status = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=10, check=False)
-        except (OSError, subprocess.TimeoutExpired):
-            status = None
-        if status and "Status: active" in (status.stdout or ""):
-            for port in unique_ports:
-                run_firewall_command(["ufw", "allow", f"{port}/tcp"])
-            print(f"Opened ports in UFW: {', '.join(map(str, unique_ports))}")
-            opened = True
+    if ufw_is_active():
+        for port in unique_ports:
+            run_firewall_command(["ufw", "allow", f"{port}/tcp"])
+        print(f"Opened ports in UFW: {', '.join(map(str, unique_ports))}")
+        opened = True
 
-    if shutil.which("firewall-cmd"):
-        try:
-            state = subprocess.run(
-                ["firewall-cmd", "--state"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            state = None
-        if state and state.returncode == 0 and "running" in (state.stdout or ""):
-            for port in unique_ports:
-                run_firewall_command(["firewall-cmd", "--permanent", "--add-port", f"{port}/tcp"])
-            run_firewall_command(["firewall-cmd", "--reload"])
-            print(f"Opened ports in firewalld: {', '.join(map(str, unique_ports))}")
-            opened = True
+    if firewalld_is_active():
+        for port in unique_ports:
+            run_firewall_command(["firewall-cmd", "--permanent", "--add-port", f"{port}/tcp"])
+        run_firewall_command(["firewall-cmd", "--reload"])
+        print(f"Opened ports in firewalld: {', '.join(map(str, unique_ports))}")
+        opened = True
 
     if not opened:
         print(
@@ -901,16 +916,173 @@ def cloudflare_ip_ranges() -> Tuple[List[str], str]:
     return [], "none"
 
 
-def open_cloudflare_origin_ports_if_active(ports: List[int]) -> None:
-    unique_ports = sorted({int(p) for p in ports if int(p) > 0})
-    if not unique_ports:
+def normalize_ports(ports: List[int]) -> List[int]:
+    normalized: List[int] = []
+    for port in ports:
+        try:
+            value = int(port)
+        except (TypeError, ValueError):
+            continue
+        if value > 0 and value not in normalized:
+            normalized.append(value)
+    return sorted(normalized)
+
+
+def normalize_ports_value(value: Any) -> List[int]:
+    return normalize_ports(value) if isinstance(value, list) else []
+
+
+def normalize_ranges_value(value: Any) -> List[str]:
+    return normalize_ip_ranges([str(x) for x in value]) if isinstance(value, list) else []
+
+
+def firewall_rule_pairs(ports: List[int], ranges: List[str]) -> Set[Tuple[int, str]]:
+    return {(int(port), str(ip_range)) for port in ports for ip_range in ranges}
+
+
+def load_cloudflare_firewall_state() -> Dict[str, Any]:
+    try:
+        with open(CF_FIREWALL_STATE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_cloudflare_firewall_state(state: Dict[str, Any]) -> None:
+    try:
+        parent = os.path.dirname(CF_FIREWALL_STATE_PATH)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(CF_FIREWALL_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.chmod(CF_FIREWALL_STATE_PATH, 0o600)
+    except OSError as e:
+        print(f"Failed to save Cloudflare firewall state: {e}")
+
+
+def remove_cloudflare_firewall_state_if_empty(state: Dict[str, Any]) -> None:
+    has_rules = cloudflare_firewall_state_has_rules(state)
+    if has_rules or normalize_ports_value(state.get("ports")):
+        save_cloudflare_firewall_state(state)
+        return
+    try:
+        if os.path.exists(CF_FIREWALL_STATE_PATH):
+            os.remove(CF_FIREWALL_STATE_PATH)
+    except OSError:
         return
 
+
+def cloudflare_firewall_state_has_rules(state: Dict[str, Any]) -> bool:
+    backends = state.get("backends") if isinstance(state.get("backends"), dict) else {}
+    for item in backends.values():
+        if not isinstance(item, dict):
+            continue
+        ports = normalize_ports_value(item.get("ports"))
+        ranges = normalize_ranges_value(item.get("ranges"))
+        if ports and ranges:
+            return True
+    return False
+
+
+def backend_state_pairs(state: Dict[str, Any], backend: str) -> Set[Tuple[int, str]]:
+    backends = state.get("backends")
+    if not isinstance(backends, dict):
+        return set()
+    item = backends.get(backend)
+    if not isinstance(item, dict):
+        return set()
+    ports = normalize_ports_value(item.get("ports"))
+    ranges = normalize_ranges_value(item.get("ranges"))
+    return firewall_rule_pairs(ports, ranges)
+
+
+def set_backend_state(state: Dict[str, Any], backend: str, pairs: Set[Tuple[int, str]]) -> None:
+    backends = state.setdefault("backends", {})
+    if not isinstance(backends, dict):
+        backends = {}
+        state["backends"] = backends
+    ports = sorted({port for port, _ in pairs})
+    ranges = normalize_ip_ranges([ip_range for _, ip_range in sorted(pairs)])
+    if ports and ranges:
+        backends[backend] = {"ports": ports, "ranges": ranges}
+    elif backend in backends:
+        del backends[backend]
+
+
+def active_cloudflare_firewall_backends() -> List[str]:
+    backends: List[str] = []
+    if ufw_is_active():
+        backends.append("ufw")
+    if firewalld_is_active():
+        backends.append("firewalld")
+    return backends
+
+
+def ufw_rule_command(action: str, port: int, ip_range: str) -> List[str]:
+    base = ["ufw"]
+    if action == "delete":
+        base.append("delete")
+    base.extend(["allow", "proto", "tcp", "from", ip_range, "to", "any", "port", str(port)])
+    return base
+
+
+def firewalld_rich_rule(port: int, ip_range: str) -> str:
+    family = "ipv6" if ":" in ip_range else "ipv4"
+    return f"rule family={family} source address={ip_range} port port={port} protocol=tcp accept"
+
+
+def firewalld_rule_command(action: str, port: int, ip_range: str) -> List[str]:
+    flag = "--remove-rich-rule" if action == "delete" else "--add-rich-rule"
+    return ["firewall-cmd", "--permanent", flag, firewalld_rich_rule(port, ip_range)]
+
+
+def apply_cloudflare_firewall_backend(
+    backend: str,
+    current_pairs: Set[Tuple[int, str]],
+    desired_pairs: Set[Tuple[int, str]],
+) -> Set[Tuple[int, str]]:
+    to_delete = sorted(current_pairs - desired_pairs)
+    to_add = sorted(desired_pairs - current_pairs)
+    applied_pairs = set(current_pairs)
+
+    for port, ip_range in to_delete:
+        if backend == "ufw":
+            run_firewall_command(ufw_rule_command("delete", port, ip_range), quiet=True)
+        else:
+            run_firewall_command(firewalld_rule_command("delete", port, ip_range), quiet=True)
+        applied_pairs.discard((port, ip_range))
+
+    for port, ip_range in to_add:
+        if backend == "ufw":
+            ok = run_firewall_command(ufw_rule_command("add", port, ip_range))
+        else:
+            ok = run_firewall_command(firewalld_rule_command("add", port, ip_range))
+        if ok:
+            applied_pairs.add((port, ip_range))
+
+    if backend == "firewalld" and (to_add or to_delete):
+        run_firewall_command(["firewall-cmd", "--reload"])
+    return applied_pairs
+
+
+def sync_cloudflare_origin_firewall_ports(ports: List[int]) -> None:
+    desired_ports = normalize_ports(ports)
+    state = load_cloudflare_firewall_state()
     ranges, source = cloudflare_ip_ranges()
+    previous_ranges = normalize_ranges_value(state.get("ranges"))
+
+    if source == "fallback" and previous_ranges:
+        ranges = previous_ranges
+        source = "state"
+    if not ranges and previous_ranges:
+        ranges = previous_ranges
+        source = "state"
+
     if not ranges:
         print(
             "Could not load Cloudflare IP ranges. Node port firewall rules were not changed; "
-            f"make sure Cloudflare can reach: {', '.join(map(str, unique_ports))}/tcp"
+            f"make sure Cloudflare can reach: {', '.join(map(str, desired_ports))}/tcp"
         )
         return
     if source == "fallback":
@@ -919,55 +1091,140 @@ def open_cloudflare_origin_ports_if_active(ports: List[int]) -> None:
             "Review firewall rules after network access is restored."
         )
 
-    opened = False
-    if shutil.which("ufw"):
-        try:
-            status = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=10, check=False)
-        except (OSError, subprocess.TimeoutExpired):
-            status = None
-        if status and "Status: active" in (status.stdout or ""):
-            added = 0
-            for port in unique_ports:
-                for ip_range in ranges:
-                    if run_firewall_command(["ufw", "allow", "proto", "tcp", "from", ip_range, "to", "any", "port", str(port)]):
-                        added += 1
-            print(
-                "Opened node ports in UFW for Cloudflare IP ranges: "
-                f"{', '.join(map(str, unique_ports))} ({added} rules)"
-            )
-            opened = True
-
-    if shutil.which("firewall-cmd"):
-        try:
-            state = subprocess.run(
-                ["firewall-cmd", "--state"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            state = None
-        if state and state.returncode == 0 and "running" in (state.stdout or ""):
-            added = 0
-            for port in unique_ports:
-                for ip_range in ranges:
-                    family = "ipv6" if ":" in ip_range else "ipv4"
-                    rich_rule = f"rule family={family} source address={ip_range} port port={port} protocol=tcp accept"
-                    if run_firewall_command(["firewall-cmd", "--permanent", "--add-rich-rule", rich_rule]):
-                        added += 1
-            run_firewall_command(["firewall-cmd", "--reload"])
-            print(
-                "Opened node ports in firewalld for Cloudflare IP ranges: "
-                f"{', '.join(map(str, unique_ports))} ({added} rules)"
-            )
-            opened = True
-
-    if not opened:
+    desired_pairs = firewall_rule_pairs(desired_ports, ranges)
+    active_backends = active_cloudflare_firewall_backends()
+    if not active_backends:
+        state["version"] = 1
+        state["ports"] = desired_ports
+        state["ranges"] = ranges
+        state["updated_at"] = int(time.time())
+        remove_cloudflare_firewall_state_if_empty(state)
         print(
             "No active UFW/firewalld detected. Firewall auto-enable is skipped; "
-            f"make sure the cloud security group allows Cloudflare to reach: {', '.join(map(str, unique_ports))}/tcp"
+            f"make sure the cloud security group allows Cloudflare to reach: {', '.join(map(str, desired_ports))}/tcp"
         )
+        return
+
+    for backend in active_backends:
+        current_pairs = backend_state_pairs(state, backend)
+        next_pairs = apply_cloudflare_firewall_backend(backend, current_pairs, desired_pairs)
+        set_backend_state(state, backend, next_pairs)
+        added = len(next_pairs - current_pairs)
+        removed = len(current_pairs - next_pairs)
+        print(f"Synced Cloudflare firewall rules for {backend}: added {added}, removed {removed}")
+
+    state["version"] = 1
+    state["ports"] = desired_ports
+    state["ranges"] = ranges
+    state["updated_at"] = int(time.time())
+    remove_cloudflare_firewall_state_if_empty(state)
+
+
+def open_cloudflare_origin_ports_if_active(ports: List[int]) -> None:
+    sync_cloudflare_origin_firewall_ports(ports)
+
+
+def node_ports_from_deployment_state(state: Optional[Dict[str, Any]]) -> List[int]:
+    if not isinstance(state, dict):
+        return []
+    routes = state.get("routes")
+    if not isinstance(routes, list):
+        return []
+    ports: List[int] = []
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        try:
+            ports.append(int(route.get("port", 0)))
+        except (TypeError, ValueError):
+            continue
+    return normalize_ports(ports)
+
+
+def sync_cloudflare_firewall_from_state() -> None:
+    firewall_state = load_cloudflare_firewall_state()
+    ports = normalize_ports_value(firewall_state.get("ports"))
+    if not ports:
+        if cloudflare_firewall_state_has_rules(firewall_state):
+            sync_cloudflare_origin_firewall_ports([])
+            return
+        ports = node_ports_from_deployment_state(load_last_state())
+    if not ports:
+        print("No managed node ports found for Cloudflare firewall sync")
+        return
+    sync_cloudflare_origin_firewall_ports(ports)
+
+
+def write_text_if_changed(path: str, content: str, mode: int = 0o644) -> bool:
+    try:
+        current = ""
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                current = f.read()
+        if current == content:
+            return False
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(path, mode)
+        return True
+    except OSError:
+        return False
+
+
+def systemd_available() -> bool:
+    return os.geteuid() == 0 and shutil.which("systemctl") is not None and os.path.isdir("/run/systemd/system")
+
+
+def run_systemctl(args: List[str]) -> bool:
+    try:
+        proc = subprocess.run(["systemctl"] + args, capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if proc.returncode != 0:
+        output = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+        if output:
+            print(output[-1000:])
+        return False
+    return True
+
+
+def ensure_cloudflare_firewall_timer() -> None:
+    if not systemd_available():
+        return
+    python_path = shutil.which("python3") or sys.executable or "/usr/bin/python3"
+    service_content = (
+        "[Unit]\n"
+        "Description=Sync 3x-ui Cloudflare origin firewall rules\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={python_path} {DEPLOYER_INSTALL_PATH} --sync-cloudflare-firewall\n"
+    )
+    timer_content = (
+        "[Unit]\n"
+        "Description=Run 3x-ui Cloudflare origin firewall sync periodically\n"
+        "\n"
+        "[Timer]\n"
+        "OnBootSec=5min\n"
+        "OnUnitActiveSec=6h\n"
+        "RandomizedDelaySec=15min\n"
+        "Persistent=true\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+    changed = False
+    changed = write_text_if_changed(CF_FIREWALL_SERVICE_PATH, service_content) or changed
+    changed = write_text_if_changed(CF_FIREWALL_TIMER_PATH, timer_content) or changed
+    if changed:
+        run_systemctl(["daemon-reload"])
+    if run_systemctl(["enable", "--now", CF_FIREWALL_TIMER]):
+        print(f"Cloudflare firewall sync timer enabled: {CF_FIREWALL_TIMER}")
 
 
 def read_panel_user_from_db() -> Tuple[str, str]:
@@ -1169,6 +1426,7 @@ def ensure_cfd_command() -> bool:
         os.chmod(CFD_BIN, 0o755)
         if first_install:
             print(f"Registered shortcut command cfd. Run cfd later to open this script.")
+        ensure_cloudflare_firewall_timer()
         return True
     except OSError:
         return False
@@ -3283,6 +3541,7 @@ def uninstall_last_config(
             continue
     tags = [str(x) for x in state.get("tags", []) if str(x).strip()]
     delete_managed_inbounds(backend, inbound_ids, tags, panel=panel)
+    sync_cloudflare_origin_firewall_ports([])
 
 
 def run_deploy_install(
@@ -3392,6 +3651,15 @@ def run_deploy_install(
 
 
 def main() -> None:
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--sync-cloudflare-firewall":
+            sync_cloudflare_firewall_from_state()
+            return
+        if sys.argv[1] in ("-h", "--help"):
+            print("Usage: xui_cf_deployer.py [--sync-cloudflare-firewall]")
+            return
+        exit_error(f"Unknown argument: {sys.argv[1]}")
+
     ensure_cfd_command()
     resolve_deployer_cf_url()
     mode = select_mode_interactive()

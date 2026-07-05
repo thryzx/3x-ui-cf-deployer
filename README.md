@@ -57,6 +57,9 @@ Use mode 4 when 3x-ui is not installed. Use mode 1 when 3x-ui is already install
 - Panel certificate: `/root/cert/<panel-domain>/`
 - acme.sh renewal config: `/root/.acme.sh/`
 - Cloudflare IP cache: `/etc/x-ui/cf_cloudflare_ips.json`
+- Cloudflare firewall rule state: `/etc/x-ui/cf_firewall_state.json`
+- Cloudflare firewall sync service: `/etc/systemd/system/cf-deployer-cloudflare-firewall.service`
+- Cloudflare firewall sync timer: `/etc/systemd/system/cf-deployer-cloudflare-firewall.timer`
 - Legacy Cloudflare credential file: `/etc/x-ui/cf_account.json`
 
 The deployer no longer uses `/etc/x-ui/cf_account.json`. If that legacy file exists, the script only warns about it.
@@ -192,6 +195,7 @@ Behavior:
 - Create node hostname SSL Configuration Rule: `flexible`.
 - Create or merge Origin Rules to route paths to selected local ports.
 - Open generated node ports for Cloudflare IP ranges only when UFW/firewalld is active. The script fetches Cloudflare's official IP list at runtime, caches successful results, and only uses a bundled fallback if both live fetch and cache are unavailable.
+- Install a systemd timer that periodically syncs Cloudflare firewall rules. The sync adds new Cloudflare IP ranges and removes old ranges managed by this script.
 - Output subscription links.
 - Save subscription output to `cf_auto_last_links.txt`.
 
@@ -204,6 +208,7 @@ Rollback behavior:
 - Delete x-ui inbounds created by the last run.
 - Remove managed Origin Rules for the node hostname.
 - Remove the node hostname SSL Configuration Rule.
+- Remove Cloudflare firewall rules managed by this script. If UFW/firewalld is inactive during uninstall, pending cleanup remains in `/etc/x-ui/cf_firewall_state.json` for the next timer run.
 - Restore/delete the node DNS record based on the previous state.
 - Remove the local deployment state file.
 
