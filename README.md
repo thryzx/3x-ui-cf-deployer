@@ -285,6 +285,7 @@ The WebSocket path is URL-encoded into the `path` parameter.
 
 - Zone match failure: check that the domain belongs to the Cloudflare account used by the token.
 - 3x-ui API failure: check panel URL, WebBasePath, credentials, or API Token.
+- Panel API unreachable during deploy: auto backend selection falls back to direct SQLite when the local database is available.
 - HTTPS certificate error: allow insecure local panel TLS, or use `http://127.0.0.1:<port>`.
 - Permission error: run the script with `sudo`.
 - Existing last deployment: Deploy Nodes adds only missing selected protocols for the same domain. Use uninstall mode only for a different domain or an incomplete local state file.

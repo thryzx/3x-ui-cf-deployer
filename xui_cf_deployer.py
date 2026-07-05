@@ -174,6 +174,8 @@ def call_json_api(
                 return {"success": False, "errors": [{"message": body}]}
         return {"success": False, "errors": [{"message": f"HTTP {e.code}"}]}
     except error.URLError as e:
+        if not exit_on_http_error:
+            return {"success": False, "errors": [{"message": str(e)}]}
         exit_error(f"Network error: {e}")
 
     if not body:
@@ -1862,6 +1864,10 @@ def auto_select_backend(
         return from_state, "state file record"
 
     if api_auth_available(env):
+        if not env.get("api_reachable", True):
+            if env.get("db_available"):
+                return BACKEND_DB, "API Token detected but panel API is unreachable, using direct SQLite"
+            exit_error("API Token detected but panel API is unreachable and the local database does not exist")
         return BACKEND_API, "API Token detected, using API"
 
     if env.get("db_available"):

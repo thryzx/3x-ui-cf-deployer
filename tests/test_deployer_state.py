@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from urllib import parse
+from urllib import error
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -28,6 +29,30 @@ def load_module():
 class DeployerStateTests(unittest.TestCase):
     def setUp(self):
         self.module = load_module()
+
+    def test_probe_panel_api_network_error_returns_false(self):
+        class RefusingOpener:
+            def open(self, req, timeout=0):
+                raise error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+        old_build_opener = self.module.build_opener
+        self.module.build_opener = lambda *handlers: RefusingOpener()
+        try:
+            self.assertFalse(self.module.probe_panel_api("http://127.0.0.1:2053", "token", False))
+        finally:
+            self.module.build_opener = old_build_opener
+
+    def test_auto_select_backend_falls_back_to_db_when_api_unreachable(self):
+        backend, reason = self.module.auto_select_backend(
+            {
+                "api_token": "token",
+                "api_reachable": False,
+                "db_available": True,
+            }
+        )
+
+        self.assertEqual(backend, self.module.BACKEND_DB)
+        self.assertIn("unreachable", reason)
 
     def test_vmess_subscription_uses_worker_mess_flag(self):
         links = self.module.build_links(
