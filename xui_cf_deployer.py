@@ -48,7 +48,10 @@ PORT_MAX = 60000
 PROTOCOL_ORDER = ["vless", "trojan", "vmess"]
 PROTOCOL_SUFFIX = {"vless": "vl", "trojan": "tr", "vmess": "vm"}
 PROTOCOL_LABEL = {"vless": "VLESS", "trojan": "TROJAN", "vmess": "VMESS"}
-PROTOCOL_QUERY_FLAG = {"vless": "ev", "trojan": "et", "vmess": "evm"}
+PROTOCOL_PATH_PARAM = {"vless": "vlp", "trojan": "trp", "vmess": "vmp"}
+ALL_LINK_KEY = "all"
+DEFAULT_NODE_FLAG = "\U0001f1fa\U0001f1f8"
+DEFAULT_NODE_COUNTRY = "US"
 MANAGED_RULE_PREFIX = "3x-ui-auto "
 MANAGED_SSL_RULE_PREFIX = "3x-ui-auto ssl "
 ORIGIN_RULE_PHASE = "http_request_origin"
@@ -1591,6 +1594,7 @@ def prompt_deploy_context() -> Dict[str, Any]:
     selected_protocols = parse_protocol_selection(
         input("Protocols(1=vless,2=trojan,3=vmess, comma-separated, empty=all): ")
     )
+    node_label = prompt_node_label()
 
     if not cf_token or not selected_protocols:
         exit_error("API Token and protocol selection cannot be empty")
@@ -1622,6 +1626,7 @@ def prompt_deploy_context() -> Dict[str, Any]:
         "panel_domain": panel_domain,
         "public_ip": public_ip,
         "selected_protocols": selected_protocols,
+        "node_label": node_label,
     }
 
 
@@ -2491,6 +2496,27 @@ def parse_protocol_selection(raw: str) -> List[str]:
     return selected
 
 
+def normalize_node_country(raw: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9]", "", raw.strip()).upper()
+    return value or DEFAULT_NODE_COUNTRY
+
+
+def prompt_node_label() -> Dict[str, str]:
+    raw_flag = input("Node flag emoji(Enter=US flag, type skip to skip): ").strip()
+    if raw_flag.lower() in ("skip", "none", "no", "n"):
+        node_flag = ""
+    else:
+        node_flag = raw_flag or DEFAULT_NODE_FLAG
+
+    node_country = normalize_node_country(input(f"Country code(Enter={DEFAULT_NODE_COUNTRY}): "))
+    node_name = input("Node base name(optional, Enter=keep worker default): ").strip()
+    return {
+        "flag": node_flag,
+        "country": node_country,
+        "name": node_name,
+    }
+
+
 def get_inbounds_schema(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     cursor = conn.cursor()
     cursor.execute("PRAGMA table_info(inbounds)")
@@ -2718,11 +2744,43 @@ def delete_managed_inbounds(
     restart_xui_service()
 
 
+def subscription_enabled_params(protocols: List[str]) -> Dict[str, str]:
+    enabled = set(protocols)
+    vmess_enabled = "vmess" in enabled
+    return {
+        "ev": "yes" if "vless" in enabled else "no",
+        "et": "yes" if "trojan" in enabled else "no",
+        "mess": "yes" if vmess_enabled else "no",
+        "evm": "yes" if vmess_enabled else "no",
+    }
+
+
+def subscription_node_label_params(node_label: Optional[Dict[str, str]]) -> Dict[str, str]:
+    if not isinstance(node_label, dict):
+        return {}
+    params: Dict[str, str] = {}
+    node_flag = str(node_label.get("flag") or "").strip()
+    node_country = normalize_node_country(str(node_label.get("country") or DEFAULT_NODE_COUNTRY))
+    node_name = str(node_label.get("name") or "").strip()
+    if node_flag:
+        params["nf"] = node_flag
+    if node_country:
+        params["cc"] = node_country
+    if node_name:
+        params["nn"] = node_name
+    return params
+
+
+def encode_subscription_url(base_url: str, params: Dict[str, str]) -> str:
+    return f"{base_url}?{parse.urlencode(params, safe='', quote_via=parse.quote)}"
+
+
 def build_links(
     user_uuid: str,
     domain: str,
     routes: List[Dict[str, Any]],
     deployer_cf_url: Optional[str] = None,
+    node_label: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
     base_root = normalize_deployer_cf_url(deployer_cf_url or current_deployer_cf_url())
     base_url = f"{base_root}/{user_uuid}/sub"
@@ -2733,19 +2791,52 @@ def build_links(
         "egi": "no",
         "dkby": "yes",
     }
+    common.update(subscription_node_label_params(node_label))
 
-    links = {}
+    route_protocols: List[str] = []
     for route in routes:
-        protocol = route["protocol"]
+        protocol = str(route.get("protocol") or "").strip().lower()
+        if protocol in PROTOCOL_ORDER and protocol not in route_protocols:
+            route_protocols.append(protocol)
+
+    links: Dict[str, str] = {}
+    if route_protocols:
         params = dict(common)
-        params["ev"] = "no"
-        params["et"] = "no"
-        params["evm"] = "no"
-        params[PROTOCOL_QUERY_FLAG[protocol]] = "yes"
-        params["path"] = route["path"]
-        links[protocol] = f"{base_url}?{parse.urlencode(params, safe='', quote_via=parse.quote)}"
+        params.update(subscription_enabled_params(route_protocols))
+        params["path"] = str(routes[0]["path"])
+        for route in routes:
+            protocol = str(route.get("protocol") or "").strip().lower()
+            if protocol in PROTOCOL_PATH_PARAM:
+                params[PROTOCOL_PATH_PARAM[protocol]] = str(route["path"])
+        links[ALL_LINK_KEY] = encode_subscription_url(base_url, params)
+
+    for route in routes:
+        protocol = str(route["protocol"]).strip().lower()
+        if protocol not in PROTOCOL_ORDER:
+            continue
+        params = dict(common)
+        params.update(subscription_enabled_params([protocol]))
+        params["path"] = str(route["path"])
+        links[protocol] = encode_subscription_url(base_url, params)
 
     return links
+
+
+def iter_subscription_output(links: Dict[str, str], order: List[str]) -> List[Tuple[str, str]]:
+    output: List[Tuple[str, str]] = []
+    all_link = links.get(ALL_LINK_KEY)
+    if all_link:
+        output.append(("ALL", all_link))
+    for protocol in order:
+        p = str(protocol).strip().lower()
+        if p in links:
+            output.append((PROTOCOL_LABEL.get(p, p.upper()), links[p]))
+    return output
+
+
+def print_subscription_links(links: Dict[str, str], order: List[str]) -> None:
+    for label, link in iter_subscription_output(links, order):
+        print(f"{label} subscription {link}")
 
 
 def load_last_state() -> Optional[Dict[str, Any]]:
@@ -2785,10 +2876,8 @@ def save_last_links_snapshot(domain: str, user_uuid: str, links: Dict[str, str],
         f"UUID: {user_uuid}",
         "",
     ]
-    for protocol in order:
-        link = links.get(protocol)
-        if link:
-            lines.append(f"{PROTOCOL_LABEL[protocol]} subscription {link}")
+    for label, link in iter_subscription_output(links, order):
+        lines.append(f"{label} subscription {link}")
     lines.append("")
     content = "\n".join(lines)
     try:
@@ -2990,10 +3079,7 @@ def print_last_links() -> None:
         links = state.get("links")
         if isinstance(links, dict):
             order = state.get("selected_protocols") or PROTOCOL_ORDER
-            for protocol in order:
-                p = str(protocol).lower()
-                if p in links:
-                    print(f"{PROTOCOL_LABEL.get(p, p.upper())} subscription {links[p]}")
+            print_subscription_links(links, [str(p).lower() for p in order])
             return
 
         legacy_domain = str(state.get("domain", "")).strip()
@@ -3005,12 +3091,12 @@ def print_last_links() -> None:
                 legacy_domain,
                 legacy_routes,
                 current_deployer_cf_url(state),
+                state.get("node_label") if isinstance(state.get("node_label"), dict) else None,
             )
             order = state.get("selected_protocols") or [r.get("protocol") for r in legacy_routes]
             order = [str(p).lower() for p in order if str(p).lower() in links]
             save_last_links_snapshot(legacy_domain, legacy_uuid, links, order)
-            for protocol in order:
-                print(f"{PROTOCOL_LABEL.get(protocol, protocol.upper())} subscription {links[protocol]}")
+            print_subscription_links(links, order)
             return
 
     if os.path.exists(DB_PATH):
@@ -3022,9 +3108,7 @@ def print_last_links() -> None:
             links = build_links(str(recovered["uuid"]), domain, recovered["routes"], current_deployer_cf_url())
             order = recovered["selected_protocols"]
             save_last_links_snapshot(domain, str(recovered["uuid"]), links, order)
-            for protocol in order:
-                if protocol in links:
-                    print(f"{PROTOCOL_LABEL[protocol]} subscription {links[protocol]}")
+            print_subscription_links(links, order)
             return
 
     if os.environ.get("XUI_API_TOKEN") or os.environ.get("XUI_PANEL_URL"):
@@ -3038,9 +3122,7 @@ def print_last_links() -> None:
             links = build_links(str(recovered["uuid"]), domain, recovered["routes"], current_deployer_cf_url())
             order = recovered["selected_protocols"]
             save_last_links_snapshot(domain, str(recovered["uuid"]), links, order)
-            for protocol in order:
-                if protocol in links:
-                    print(f"{PROTOCOL_LABEL[protocol]} subscription {links[protocol]}")
+            print_subscription_links(links, order)
             return
 
     exit_error("No previous subscriptions available")
@@ -3192,7 +3274,8 @@ def run_deploy_install(
     apply_ssl_config_rules(zone_id, headers, [(domain, "flexible", "node")])
     apply_origin_rules(zone_id, headers, domain, routes)
 
-    links = build_links(user_uuid, domain, routes, deployer_cf_url)
+    node_label = context.get("node_label") if isinstance(context.get("node_label"), dict) else None
+    links = build_links(user_uuid, domain, routes, deployer_cf_url, node_label)
     save_last_links_snapshot(domain=domain, user_uuid=user_uuid, links=links, order=selected_protocols)
 
     state_version = 2 if backend == BACKEND_API else 1
@@ -3217,14 +3300,14 @@ def run_deploy_install(
             "origin_rules_backup": origin_rules_before,
             "links": links,
             "selected_protocols": selected_protocols,
+            "node_label": node_label or {},
             "panel_domain": str(context.get("panel_domain") or ""),
         }
     )
 
     print("Success")
     print(f"Subscriptions saved to {LAST_LINKS_PATH}")
-    for protocol in selected_protocols:
-        print(f"{PROTOCOL_LABEL[protocol]} subscription {links[protocol]}")
+    print_subscription_links(links, selected_protocols)
 
 
 def main() -> None:

@@ -17,6 +17,8 @@ Main changes in this fork:
 - Added automatic selection of Cloudflare-supported HTTPS panel ports.
 - Added panel certificate issuance through Cloudflare DNS-01 and automatic 3x-ui panel certificate configuration.
 - Added best-effort firewall opening for active UFW/firewalld setups.
+- Added subscription node label parameters for flag, country code, optional base name override, and per-protocol sequence numbers.
+- Added an `ALL` subscription link while keeping per-protocol links for diagnostics.
 - Expanded documentation for token permissions, acme.sh token storage, and the security boundary of node `flexible` mode.
 
 `xui_cf_deployer.py` is a Python 3 standard-library-only script for VPS deployment automation:
@@ -175,7 +177,10 @@ Prompts:
 2. Node domain, for example `node.example.com`.
 3. Cloudflare API Token.
 4. Protocol selection: `1=vless,2=trojan,3=vmess`, comma-separated, empty means all.
-5. 3x-ui panel domain, default `panel.<root-domain>`, or `skip`.
+5. Node flag emoji, default US flag, or `skip`.
+6. Country code, default `US`.
+7. Node base name, optional. Empty keeps the current Worker default node name.
+8. 3x-ui panel domain, default `panel.<root-domain>`, or `skip`.
 
 Behavior:
 
@@ -189,7 +194,7 @@ Behavior:
 - Create proxied node DNS.
 - Create node hostname SSL Configuration Rule: `flexible`.
 - Create or merge Origin Rules to route paths to selected local ports.
-- Output subscription links.
+- Output `ALL` subscription first, then selected per-protocol subscriptions.
 - Save subscription output to `cf_auto_last_links.txt`.
 
 The script does not change the Cloudflare zone-wide SSL mode.
@@ -243,7 +248,169 @@ Protocol flags:
 - Enabled protocol: `yes`
 - Disabled protocol: `no`
 
-The WebSocket path is URL-encoded into the `path` parameter.
+The WebSocket path is URL-encoded into the `path` parameter for per-protocol links.
+
+Node label parameters:
+
+- `nf`: node flag. This may contain a flag emoji at runtime.
+- `cc`: country code, for example `US`.
+- `nn`: optional base name override. If omitted, the Worker keeps its existing default node name.
+
+The Worker should format generated client node names as:
+
+```text
+<flag>[US][VLESS] <base name> - 01
+```
+
+The sequence number is counted per protocol. If a protocol produces only one final node, the Worker should omit the ` - 01` suffix.
+
+Aggregate subscription parameters:
+
+- `ALL` links enable all selected protocols in one subscription URL.
+- `vlp`: VLESS WebSocket path.
+- `trp`: Trojan WebSocket path.
+- `vmp`: VMess WebSocket path.
+- `path`: fallback path for older Worker behavior and single-protocol links.
+- VMess compatibility: links include both `mess` and `evm`.
+
+The stock `byJoey/yx-auto` Worker must be adapted before the `ALL` link can safely mix protocols with different paths. Per-protocol links keep working with the old single `path` behavior.
+
+## yx-auto Worker Compatibility
+
+Patch your `_worker.js` so it reads the extra parameters, keeps one path per protocol, and renames nodes after all links for each protocol are collected.
+
+In the subscription route parser, make VMess accept both parameter names and pass path and label maps:
+
+```js
+const vmEnabled = url.searchParams.get('mess') === 'yes' || url.searchParams.get('evm') === 'yes';
+const customPath = url.searchParams.get('path') || '/';
+const pathMap = {
+  vless: url.searchParams.get('vlp') || customPath,
+  trojan: url.searchParams.get('trp') || customPath,
+  vmess: url.searchParams.get('vmp') || customPath,
+};
+const nodeLabel = {
+  flag: url.searchParams.get('nf') || '',
+  country: url.searchParams.get('cc') || '',
+  name: url.searchParams.get('nn') || '',
+};
+
+return await handleSubscriptionRequest(
+  request,
+  uuid,
+  domain,
+  piu,
+  ipv4Enabled,
+  ipv6Enabled,
+  ispMobile,
+  ispUnicom,
+  ispTelecom,
+  evEnabled,
+  etEnabled,
+  vmEnabled,
+  disableNonTLS,
+  pathMap,
+  echConfig,
+  nodeLabel
+);
+```
+
+Add these helpers before `handleSubscriptionRequest`:
+
+```js
+function b64EncodeUnicode(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  bytes.forEach(byte => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary);
+}
+
+function b64DecodeUnicode(value) {
+  const binary = atob(value);
+  const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
+function formatNodeName(baseName, protocol, nodeLabel, index, total) {
+  const label = nodeLabel || {};
+  const base = String(label.name || baseName || protocol).trim();
+  const flag = String(label.flag || '').trim();
+  const country = String(label.country || '').trim().toUpperCase();
+  const prefix = `${flag}${country ? `[${country}]` : ''}[${protocol}]`;
+  const suffix = total > 1 ? ` - ${String(index + 1).padStart(2, '0')}` : '';
+  return `${prefix} ${base}${suffix}`.trim();
+}
+
+function renamePlainNodeLink(link, protocol, nodeLabel, index, total) {
+  const marker = link.lastIndexOf('#');
+  const baseName = marker >= 0 ? decodeURIComponent(link.slice(marker + 1)) : protocol;
+  const newName = encodeURIComponent(formatNodeName(baseName, protocol, nodeLabel, index, total));
+  return marker >= 0 ? `${link.slice(0, marker + 1)}${newName}` : `${link}#${newName}`;
+}
+
+function renameVmessNodeLink(link, protocol, nodeLabel, index, total) {
+  const prefix = 'vmess://';
+  if (!link.startsWith(prefix)) return link;
+  const config = JSON.parse(b64DecodeUnicode(link.slice(prefix.length)));
+  config.ps = formatNodeName(config.ps || protocol, protocol, nodeLabel, index, total);
+  return `${prefix}${b64EncodeUnicode(JSON.stringify(config))}`;
+}
+
+function renameProtocolLinks(links, protocol, nodeLabel) {
+  const total = links.length;
+  return links.map((link, index) => {
+    if (protocol === 'VMESS') {
+      return renameVmessNodeLink(link, protocol, nodeLabel, index, total);
+    }
+    return renamePlainNodeLink(link, protocol, nodeLabel, index, total);
+  });
+}
+```
+
+Change `handleSubscriptionRequest` to accept `nodeLabel`, normalize `customPath` into a path map, collect links per protocol, and rename once at the end:
+
+```js
+async function handleSubscriptionRequest(
+  request,
+  user,
+  customDomain,
+  piu,
+  ipv4Enabled,
+  ipv6Enabled,
+  ispMobile,
+  ispUnicom,
+  ispTelecom,
+  evEnabled,
+  etEnabled,
+  vmEnabled,
+  disableNonTLS,
+  customPath,
+  echConfig = null,
+  nodeLabel = null
+) {
+  const pathMap = typeof customPath === 'object' && customPath !== null
+    ? customPath
+    : { vless: customPath || '/', trojan: customPath || '/', vmess: customPath || '/' };
+  const protocolLinks = { VLESS: [], TROJAN: [], VMESS: [] };
+  const addProtocolLinks = (protocol, links) => {
+    protocolLinks[protocol].push(...links);
+  };
+
+  // Replace direct finalLinks.push calls:
+  // VLESS: addProtocolLinks('VLESS', generateLinksFromSource(list, user, nodeDomain, disableNonTLS, pathMap.vless, echConfig));
+  // Trojan: addProtocolLinks('TROJAN', await generateTrojanLinksFromSource(list, user, nodeDomain, disableNonTLS, pathMap.trojan, echConfig));
+  // VMess: addProtocolLinks('VMESS', generateVMessLinksFromSource(list, user, nodeDomain, disableNonTLS, pathMap.vmess, echConfig));
+  // New IP VLESS branches should also use pathMap.vless.
+
+  finalLinks.push(...renameProtocolLinks(protocolLinks.VLESS, 'VLESS', nodeLabel));
+  finalLinks.push(...renameProtocolLinks(protocolLinks.TROJAN, 'TROJAN', nodeLabel));
+  finalLinks.push(...renameProtocolLinks(protocolLinks.VMESS, 'VMESS', nodeLabel));
+}
+```
+
+The last snippet shows the required edit pattern. Keep the rest of the original response formatting, fallback error node, and target conversion logic in place.
 
 ## Troubleshooting
 
