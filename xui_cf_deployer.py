@@ -56,7 +56,7 @@ PORT_MAX = 60000
 PROTOCOL_ORDER = ["vless", "trojan", "vmess"]
 PROTOCOL_SUFFIX = {"vless": "vl", "trojan": "tr", "vmess": "vm"}
 PROTOCOL_LABEL = {"vless": "VLESS", "trojan": "TROJAN", "vmess": "VMESS"}
-PROTOCOL_QUERY_FLAG = {"vless": "ev", "trojan": "et", "vmess": "evm"}
+PROTOCOL_QUERY_FLAG = {"vless": "ev", "trojan": "et", "vmess": "mess"}
 MANAGED_RULE_PREFIX = "3x-ui-auto "
 MANAGED_SSL_RULE_PREFIX = "3x-ui-auto ssl "
 ORIGIN_RULE_PHASE = "http_request_origin"
@@ -3161,7 +3161,7 @@ def build_links(
         params = dict(common)
         params["ev"] = "no"
         params["et"] = "no"
-        params["evm"] = "no"
+        params["mess"] = "no"
         params[PROTOCOL_QUERY_FLAG[protocol]] = "yes"
         params["path"] = route["path"]
         links[protocol] = f"{base_url}?{parse.urlencode(params, safe='', quote_via=parse.quote)}"
