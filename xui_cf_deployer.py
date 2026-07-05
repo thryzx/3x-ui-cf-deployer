@@ -2422,6 +2422,15 @@ def has_v3_client_schema(conn: sqlite3.Connection) -> bool:
     return table_exists(conn, "clients") and table_exists(conn, "client_inbounds")
 
 
+def table_columns(conn: sqlite3.Connection, table: str) -> Set[str]:
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"PRAGMA table_info({table})")
+        return {str(row[1]) for row in cursor.fetchall()}
+    except sqlite3.Error:
+        return set()
+
+
 def inbound_client_entry(protocol: str, user_uuid: str, email: str, *, v3: bool = True) -> Dict[str, Any]:
     entry: Dict[str, Any] = {
         "email": email,
@@ -2717,34 +2726,65 @@ def cleanup_v3_clients_for_inbounds(conn: sqlite3.Connection, inbound_ids: List[
 
     cursor = conn.cursor()
     placeholders = ",".join(["?"] * len(inbound_ids))
-    cursor.execute(
-        f"""
-        SELECT DISTINCT c.email
-        FROM clients c
-        JOIN client_inbounds ci ON ci.client_id = c.id
-        WHERE ci.inbound_id IN ({placeholders})
-        """,
-        inbound_ids,
-    )
-    emails = [str(row[0]) for row in cursor.fetchall() if row and row[0]]
+    clients_cols = table_columns(conn, "clients")
+    client_inbounds_cols = table_columns(conn, "client_inbounds")
+    traffic_cols = table_columns(conn, "client_traffics") if table_exists(conn, "client_traffics") else set()
+    if "inbound_id" not in client_inbounds_cols:
+        return
 
-    cursor.execute(f"DELETE FROM client_inbounds WHERE inbound_id IN ({placeholders})", inbound_ids)
+    client_ids: List[int] = []
+    emails: List[str] = []
+    try:
+        if "client_id" in client_inbounds_cols:
+            cursor.execute(
+                f"SELECT DISTINCT client_id FROM client_inbounds WHERE inbound_id IN ({placeholders})",
+                inbound_ids,
+            )
+            for row in cursor.fetchall():
+                try:
+                    client_ids.append(int(row[0]))
+                except (TypeError, ValueError):
+                    continue
+        if "email" in clients_cols and "client_id" in client_inbounds_cols:
+            cursor.execute(
+                f"""
+                SELECT DISTINCT c.email
+                FROM clients c
+                JOIN client_inbounds ci ON ci.client_id = c.id
+                WHERE ci.inbound_id IN ({placeholders})
+                """,
+                inbound_ids,
+            )
+            emails = [str(row[0]) for row in cursor.fetchall() if row and row[0]]
 
-    for email in emails:
-        cursor.execute(
-            """
-            SELECT COUNT(*)
-            FROM client_inbounds ci
-            JOIN clients c ON c.id = ci.client_id
-            WHERE c.email = ?
-            """,
-            (email,),
-        )
-        if int(cursor.fetchone()[0]) > 0:
-            continue
-        cursor.execute("DELETE FROM clients WHERE email = ?", (email,))
-        if table_exists(conn, "client_traffics"):
-            cursor.execute("DELETE FROM client_traffics WHERE email = ?", (email,))
+        if "inbound_id" in traffic_cols:
+            cursor.execute(f"DELETE FROM client_traffics WHERE inbound_id IN ({placeholders})", inbound_ids)
+        elif "email" in traffic_cols and emails:
+            traffic_placeholders = ",".join(["?"] * len(emails))
+            cursor.execute(f"DELETE FROM client_traffics WHERE email IN ({traffic_placeholders})", emails)
+
+        cursor.execute(f"DELETE FROM client_inbounds WHERE inbound_id IN ({placeholders})", inbound_ids)
+
+        if "id" in clients_cols and "client_id" in client_inbounds_cols:
+            for client_id in client_ids:
+                cursor.execute("SELECT COUNT(*) FROM client_inbounds WHERE client_id = ?", (client_id,))
+                if int(cursor.fetchone()[0]) == 0:
+                    cursor.execute("DELETE FROM clients WHERE id = ?", (client_id,))
+        elif "email" in clients_cols and emails:
+            for email in emails:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM client_inbounds ci
+                    JOIN clients c ON c.id = ci.client_id
+                    WHERE c.email = ?
+                    """,
+                    (email,),
+                )
+                if int(cursor.fetchone()[0]) == 0:
+                    cursor.execute("DELETE FROM clients WHERE email = ?", (email,))
+    except sqlite3.Error as e:
+        print(f"Skipped partial client cleanup: {e}")
 
 
 def protocol_settings_legacy(protocol: str, user_uuid: str) -> Dict[str, Any]:
@@ -3237,8 +3277,10 @@ def remove_last_state() -> None:
     try:
         if os.path.exists(STATE_PATH):
             os.remove(STATE_PATH)
+        if os.path.exists(LAST_LINKS_PATH):
+            os.remove(LAST_LINKS_PATH)
     except OSError as e:
-        exit_error(f"Failed to delete last state: {e}")
+        exit_error(f"Failed to delete last deployment cache: {e}")
 
 
 def save_last_links_snapshot(domain: str, user_uuid: str, links: Dict[str, str], order: List[str]) -> None:
@@ -3857,6 +3899,119 @@ def manage_deployed_nodes_interactive(state: Dict[str, Any]) -> None:
     run_delete_deployed_protocols(selected)
 
 
+def run_deploy_add_missing_protocols(
+    state: Dict[str, Any],
+    context: Dict[str, Any],
+    *,
+    panel_configured: bool = False,
+) -> None:
+    domain = str(context["domain"]).strip()
+    state_domain = str(state.get("domain", "")).strip()
+    zone_id = str(state.get("zone_id") or context["zone_id"]).strip()
+    user_uuid = str(state.get("uuid", "")).strip()
+    short_id = str(state.get("short_id", "")).strip() or user_uuid[:8]
+    if not state_domain or not zone_id or not user_uuid or not short_id:
+        exit_error("Last deployment state is incomplete; run uninstall before deploying again")
+    if normalize_domain(domain) != normalize_domain(state_domain):
+        exit_error(f"Existing deployment uses {state_domain}; run uninstall before deploying {domain}")
+
+    existing_routes = state.get("routes") if isinstance(state.get("routes"), list) else []
+    existing_protocols = available_protocols_from_state(state)
+    selected_protocols = normalize_protocol_names(list(context["selected_protocols"]))
+    missing_protocols = [protocol for protocol in selected_protocols if protocol not in existing_protocols]
+    if not missing_protocols:
+        print("Selected protocols are already deployed")
+        print_last_links()
+        return
+
+    if not panel_configured:
+        configure_existing_panel_cloudflare(context)
+
+    backend, runtime, reason = resolve_backend(state)
+    print(f"x-ui write backend: {backend_label(backend)} ({reason})")
+    panel = None
+    if backend == BACKEND_DB:
+        if not os.path.exists(DB_PATH):
+            exit_error(f"3x-ui database not found: {DB_PATH}")
+        normalize_existing_inbound_client_email(DB_PATH)
+        maybe_repair_v3_client_bindings(DB_PATH, "install", state)
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                existing_ports = load_existing_ports_db(conn)
+        except sqlite3.Error as e:
+            exit_error(str(e))
+    else:
+        panel = setup_panel_client(runtime, interactive=False)
+        existing_ports = load_existing_ports_api(panel)
+
+    ports = random_ports(len(missing_protocols), existing_ports)
+    new_routes = []
+    for index, protocol in enumerate(missing_protocols):
+        new_routes.append(
+            {
+                "protocol": protocol,
+                "port": ports[index],
+                "path": f"/{short_id}-{PROTOCOL_SUFFIX[protocol]}",
+            }
+        )
+
+    new_inbound_ids = create_inbounds(
+        backend,
+        user_uuid=user_uuid,
+        short_id=short_id,
+        routes=new_routes,
+        panel=panel,
+    )
+
+    headers = context["headers"]
+    public_ip = str(context["public_ip"])
+    managed_dns_record_id = upsert_dns_record(zone_id, state_domain, public_ip, headers)
+    apply_ssl_config_rules(zone_id, headers, [(state_domain, "flexible", "node")])
+
+    merged_routes = [route for route in existing_routes if isinstance(route, dict)] + new_routes
+    apply_origin_rules(zone_id, headers, state_domain, merged_routes)
+    open_cloudflare_origin_ports_if_active([int(route["port"]) for route in new_routes])
+    sync_cloudflare_origin_firewall_ports(node_ports_from_deployment_state({"routes": merged_routes}))
+
+    inbound_ids = []
+    for item in state.get("inbound_ids", []):
+        try:
+            inbound_ids.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    inbound_ids.extend(new_inbound_ids)
+
+    selected_after = [protocol for protocol in PROTOCOL_ORDER if protocol in available_protocols_from_state({"routes": merged_routes})]
+    links = build_links(user_uuid, state_domain, merged_routes, str(context["deployer_cf_url"]))
+    next_state = dict(state)
+    next_state.update(
+        {
+            "version": 2 if backend == BACKEND_API else 1,
+            "backend": backend,
+            "domain": state_domain,
+            "zone_id": zone_id,
+            "uuid": user_uuid,
+            "short_id": short_id,
+            "deployer_cf_url": str(context["deployer_cf_url"]),
+            "routes": merged_routes,
+            "inbound_ids": inbound_ids,
+            "tags": [f"{short_id}-{p}" for p in selected_after],
+            "managed_dns_record_id": managed_dns_record_id or str(state.get("managed_dns_record_id", "")),
+            "node_ssl_config_mode": "flexible",
+            "links": links,
+            "selected_protocols": selected_after,
+            "panel_domain": str(context.get("panel_domain") or state.get("panel_domain") or ""),
+        }
+    )
+    save_last_state(next_state)
+    save_last_links_snapshot(domain=state_domain, user_uuid=user_uuid, links=links, order=selected_after)
+
+    print("Success")
+    print(f"Subscriptions saved to {LAST_LINKS_PATH}")
+    for protocol in selected_after:
+        print(f"{PROTOCOL_LABEL[protocol]} subscription {links[protocol]}")
+
+
 def run_deploy_install(
     context: Optional[Dict[str, Any]] = None,
     *,
@@ -3864,8 +4019,9 @@ def run_deploy_install(
 ) -> None:
     last_state = load_last_state()
     if last_state is not None:
-        last_domain = str(last_state.get("domain", "unknown domain"))
-        exit_error(f"Detected last deployment({last_domain}); run uninstall first")
+        context = context or prompt_deploy_context()
+        run_deploy_add_missing_protocols(last_state, context, panel_configured=panel_configured)
+        return
 
     context = context or prompt_deploy_context()
     if not panel_configured:

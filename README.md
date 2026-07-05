@@ -200,6 +200,8 @@ Behavior:
 - Output subscription links.
 - Save subscription output to `cf_auto_last_links.txt`.
 
+If a previous deployment state exists, Deploy Nodes adds only missing selected protocols to the existing deployment. For example, after deleting VMess, selecting all protocols again keeps VLESS/Trojan and creates VMess with the same UUID and WebSocket path prefix.
+
 The script does not change the Cloudflare zone-wide SSL mode.
 
 ### Uninstall Mode
@@ -210,8 +212,9 @@ Rollback behavior:
 - Remove managed Origin Rules for the node hostname.
 - Remove the node hostname SSL Configuration Rule.
 - Remove Cloudflare firewall rules managed by this script. If UFW/firewalld is inactive during uninstall, pending cleanup remains in `/etc/x-ui/cf_firewall_state.json` for the next timer run.
+- Remove broad UFW/firewalld allow rules for generated node ports when present.
 - Restore/delete the node DNS record based on the previous state.
-- Remove the local deployment state file.
+- Remove the local deployment state file and subscription snapshot.
 
 Legacy state files that contain a zone-wide SSL backup trigger a best-effort global SSL restore.
 
@@ -284,7 +287,7 @@ The WebSocket path is URL-encoded into the `path` parameter.
 - 3x-ui API failure: check panel URL, WebBasePath, credentials, or API Token.
 - HTTPS certificate error: allow insecure local panel TLS, or use `http://127.0.0.1:<port>`.
 - Permission error: run the script with `sudo`.
-- Existing last deployment: use uninstall mode first.
+- Existing last deployment: Deploy Nodes adds only missing selected protocols for the same domain. Use uninstall mode only for a different domain or an incomplete local state file.
 - Origin Rules quota reached: the script lists rules and lets you delete selected entries.
 - Legacy `/etc/x-ui/cf_account.json`: the script warns about it but does not use it.
 - UFW/firewalld enabled: generated node ports are opened for Cloudflare IP ranges only. Your VPS provider security group must still allow those ports. If the official Cloudflare IP list cannot be fetched, the script uses the last cached list before falling back to its bundled bootstrap list.
