@@ -1472,6 +1472,8 @@ def build_mode_menu_items() -> List[Tuple[str, str]]:
         ("uninstall", "Uninstall"),
         ("show", "Show subscriptions"),
     ]
+    if load_last_state() is not None:
+        items.append(("manage_nodes", "Manage deployed nodes"))
     if not is_xui_installed():
         items.append(("fresh", "Fresh install (with x-ui)"))
     if has_script_installed_panel():
@@ -1510,6 +1512,12 @@ def parse_mode(raw: str, items: Optional[List[Tuple[str, str]]] = None) -> str:
         "v": "show",
         "view-links": "show",
         "Show subscriptions": "show",
+        "nodes": "manage_nodes",
+        "manage-nodes": "manage_nodes",
+        "delete-node": "manage_nodes",
+        "delete-nodes": "manage_nodes",
+        "delete-protocol": "manage_nodes",
+        "Manage deployed nodes": "manage_nodes",
         "fresh": "fresh",
         "setup": "fresh",
         "new": "fresh",
@@ -3220,6 +3228,168 @@ def save_last_links_snapshot(domain: str, user_uuid: str, links: Dict[str, str],
         exit_error(f"Failed to save last subscriptions: {e}")
 
 
+def normalize_protocol_names(protocols: List[str]) -> List[str]:
+    selected: List[str] = []
+    for item in protocols:
+        protocol = str(item).strip().lower()
+        if protocol not in PROTOCOL_ORDER:
+            continue
+        if protocol not in selected:
+            selected.append(protocol)
+    return selected
+
+
+def route_protocol(route: Any) -> str:
+    if not isinstance(route, dict):
+        return ""
+    protocol = str(route.get("protocol") or "").strip().lower()
+    return protocol if protocol in PROTOCOL_ORDER else ""
+
+
+def tag_protocol(tag: Any) -> str:
+    text = str(tag or "").strip().lower()
+    for protocol in PROTOCOL_ORDER:
+        if text.endswith(f"-{protocol}"):
+            return protocol
+    return ""
+
+
+def prune_deployment_state_protocols(
+    state: Dict[str, Any], protocols: List[str]
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    remove_protocols = set(normalize_protocol_names(protocols))
+    next_state: Dict[str, Any] = json.loads(json.dumps(state))
+    removed: Dict[str, Any] = {
+        "protocols": [],
+        "routes": [],
+        "inbound_ids": [],
+        "tags": [],
+        "links": {},
+    }
+    if not remove_protocols:
+        return next_state, removed
+
+    routes = state.get("routes") if isinstance(state.get("routes"), list) else []
+    inbound_ids = state.get("inbound_ids") if isinstance(state.get("inbound_ids"), list) else []
+    tags = state.get("tags") if isinstance(state.get("tags"), list) else []
+    links = state.get("links") if isinstance(state.get("links"), dict) else {}
+    selected_protocols = (
+        state.get("selected_protocols") if isinstance(state.get("selected_protocols"), list) else []
+    )
+
+    keep_routes: List[Dict[str, Any]] = []
+    remove_indexes: Set[int] = set()
+    for index, route in enumerate(routes):
+        protocol = route_protocol(route)
+        if protocol in remove_protocols:
+            remove_indexes.add(index)
+            removed["routes"].append(route)
+        elif isinstance(route, dict):
+            keep_routes.append(route)
+
+    if len(inbound_ids) == len(routes):
+        next_inbound_ids = []
+        for index, inbound_id in enumerate(inbound_ids):
+            if index in remove_indexes:
+                try:
+                    removed["inbound_ids"].append(int(inbound_id))
+                except (TypeError, ValueError):
+                    pass
+            else:
+                next_inbound_ids.append(inbound_id)
+        next_state["inbound_ids"] = next_inbound_ids
+
+    keep_tags: List[str] = []
+    for tag in tags:
+        protocol = tag_protocol(tag)
+        if protocol in remove_protocols:
+            removed["tags"].append(str(tag))
+        else:
+            keep_tags.append(str(tag))
+
+    next_links: Dict[str, Any] = {}
+    for key, value in links.items():
+        protocol = str(key).strip().lower()
+        if protocol in remove_protocols:
+            removed["links"][protocol] = value
+        else:
+            next_links[protocol] = value
+
+    next_selected = []
+    for item in selected_protocols:
+        protocol = str(item).strip().lower()
+        if protocol in remove_protocols:
+            if protocol not in removed["protocols"]:
+                removed["protocols"].append(protocol)
+        elif protocol in PROTOCOL_ORDER and protocol not in next_selected:
+            next_selected.append(protocol)
+
+    for route in removed["routes"]:
+        protocol = route_protocol(route)
+        if protocol and protocol not in removed["protocols"]:
+            removed["protocols"].append(protocol)
+
+    removed["protocols"] = [p for p in PROTOCOL_ORDER if p in removed["protocols"]]
+    next_state["routes"] = keep_routes
+    next_state["tags"] = keep_tags
+    next_state["links"] = next_links
+    next_state["selected_protocols"] = next_selected or [route_protocol(route) for route in keep_routes]
+    return next_state, removed
+
+
+def refresh_deployment_state_links(state: Dict[str, Any]) -> Dict[str, Any]:
+    routes = state.get("routes") if isinstance(state.get("routes"), list) else []
+    domain = str(state.get("domain", "")).strip()
+    user_uuid = str(state.get("uuid", "")).strip()
+    if not routes or not domain or not user_uuid:
+        return state
+    links = build_links(user_uuid, domain, routes, current_deployer_cf_url(state))
+    order = [str(p).lower() for p in state.get("selected_protocols", []) if str(p).lower() in links]
+    if not order:
+        order = [route_protocol(route) for route in routes if route_protocol(route) in links]
+    state["links"] = links
+    state["selected_protocols"] = order
+    return state
+
+
+def format_route_summary(index: int, route: Dict[str, Any]) -> str:
+    protocol = route_protocol(route).upper() or "UNKNOWN"
+    path = str(route.get("path") or "")
+    port = str(route.get("port") or "")
+    return f"{index}. {protocol} port={port} path={path}"
+
+
+def available_protocols_from_state(state: Dict[str, Any]) -> List[str]:
+    routes = state.get("routes") if isinstance(state.get("routes"), list) else []
+    protocols: List[str] = []
+    for route in routes:
+        protocol = route_protocol(route)
+        if protocol and protocol not in protocols:
+            protocols.append(protocol)
+    return protocols
+
+
+def parse_protocol_delete_selection(raw: str, available_protocols: List[str]) -> List[str]:
+    text = raw.strip().lower()
+    if not text:
+        return []
+    available = set(available_protocols)
+    selected: List[str] = []
+    for token in text.replace(" ", "").split(","):
+        if not token:
+            continue
+        protocol = token
+        if token in ("1", "2", "3"):
+            protocol = PROTOCOL_ORDER[int(token) - 1]
+        if protocol not in PROTOCOL_ORDER:
+            exit_error(f"Invalid protocol: {token}")
+        if protocol not in available:
+            exit_error(f"Protocol is not deployed: {protocol}")
+        if protocol not in selected:
+            selected.append(protocol)
+    return selected
+
+
 def extract_client_key(protocol: str) -> str:
     if protocol == "trojan":
         return "password"
@@ -3544,6 +3714,99 @@ def uninstall_last_config(
     sync_cloudflare_origin_firewall_ports([])
 
 
+def delete_deployed_protocols(
+    state: Dict[str, Any],
+    protocols: List[str],
+    headers: Dict[str, str],
+    backend: str,
+    panel: Optional[XuiPanelClient] = None,
+) -> None:
+    domain = str(state.get("domain", "")).strip()
+    zone_id = str(state.get("zone_id", "")).strip()
+    if not domain or not zone_id:
+        exit_error("Last state is missing domain or zone_id; cannot manage deployed nodes")
+
+    next_state, removed = prune_deployment_state_protocols(state, protocols)
+    removed_protocols = normalize_protocol_names(removed.get("protocols", []))
+    if not removed_protocols:
+        exit_error("No matching deployed protocols were found")
+
+    remaining_routes = next_state.get("routes") if isinstance(next_state.get("routes"), list) else []
+    if not remaining_routes:
+        uninstall_last_config(state, headers, backend, panel=panel)
+        remove_last_state()
+        print("All deployed nodes were removed")
+        return
+
+    current_rules = get_origin_rules(zone_id, headers)
+    next_rules = strip_managed_origin_rules(current_rules, domain) + build_origin_rules(domain, remaining_routes)
+    put_origin_rules(zone_id, headers, next_rules)
+
+    removed_ids = [int(item) for item in removed.get("inbound_ids", [])]
+    removed_tags = [str(item) for item in removed.get("tags", []) if str(item).strip()]
+    if backend == BACKEND_API and not removed_ids:
+        exit_error("API mode cannot delete selected protocols because inbound ids are missing from state")
+    delete_managed_inbounds(backend, removed_ids, removed_tags, panel=panel)
+
+    next_state = refresh_deployment_state_links(next_state)
+    save_last_state(next_state)
+
+    order = [str(p).lower() for p in next_state.get("selected_protocols", []) if str(p).lower() in PROTOCOL_ORDER]
+    links = next_state.get("links") if isinstance(next_state.get("links"), dict) else {}
+    user_uuid = str(next_state.get("uuid", "")).strip()
+    if order and links and user_uuid:
+        save_last_links_snapshot(domain=domain, user_uuid=user_uuid, links=links, order=order)
+
+    sync_cloudflare_origin_firewall_ports(node_ports_from_deployment_state(next_state))
+    labels = ", ".join(PROTOCOL_LABEL[p] for p in removed_protocols)
+    print(f"Deleted deployed protocols: {labels}")
+
+
+def run_delete_deployed_protocols(protocols: List[str]) -> None:
+    state = load_last_state()
+    if state is None:
+        exit_error("No last deployment detected; cannot manage deployed nodes")
+    selected = normalize_protocol_names(protocols)
+    if not selected:
+        exit_error("Select at least one protocol to delete")
+
+    backend, runtime, reason = resolve_backend(state)
+    print(f"x-ui write backend: {backend_label(backend)} ({reason})")
+    panel: Optional[XuiPanelClient] = None
+    if backend == BACKEND_API:
+        panel = setup_panel_client(runtime, interactive=False)
+    cf_token = prompt_cf_api_token()
+    headers = build_cf_headers(cf_token)
+    delete_deployed_protocols(state, selected, headers, backend, panel=panel)
+
+
+def manage_deployed_nodes_interactive(state: Dict[str, Any]) -> None:
+    routes = state.get("routes") if isinstance(state.get("routes"), list) else []
+    if not routes:
+        exit_error("No deployed nodes found in last state")
+
+    print("Deployed nodes:")
+    for index, route in enumerate(routes, 1):
+        if isinstance(route, dict):
+            print(f"  {format_route_summary(index, route)}")
+
+    available = available_protocols_from_state(state)
+    hint = ",".join(available)
+    raw = input(f"Protocols to delete(Enter=cancel, available={hint}): ")
+    selected = parse_protocol_delete_selection(raw, available)
+    if not selected:
+        print("Cancelled")
+        return
+
+    labels = ", ".join(PROTOCOL_LABEL[p] for p in selected)
+    confirm = input(f"Delete {labels} nodes and related rules? Type yes to continue: ").strip().lower()
+    if confirm != "yes":
+        print("Cancelled")
+        return
+
+    run_delete_deployed_protocols(selected)
+
+
 def run_deploy_install(
     context: Optional[Dict[str, Any]] = None,
     *,
@@ -3655,8 +3918,16 @@ def main() -> None:
         if sys.argv[1] == "--sync-cloudflare-firewall":
             sync_cloudflare_firewall_from_state()
             return
+        if sys.argv[1] == "--delete-protocol":
+            if len(sys.argv) < 3:
+                exit_error("Usage: xui_cf_deployer.py --delete-protocol vless|trojan|vmess[,more]")
+            protocols = []
+            for item in sys.argv[2:]:
+                protocols.extend([part for part in item.split(",") if part.strip()])
+            run_delete_deployed_protocols(protocols)
+            return
         if sys.argv[1] in ("-h", "--help"):
-            print("Usage: xui_cf_deployer.py [--sync-cloudflare-firewall]")
+            print("Usage: xui_cf_deployer.py [--sync-cloudflare-firewall] [--delete-protocol vless|trojan|vmess]")
             return
         exit_error(f"Unknown argument: {sys.argv[1]}")
 
@@ -3690,6 +3961,12 @@ def main() -> None:
     if mode == "show":
         maybe_repair_v3_client_bindings(DB_PATH, mode, last_state)
         print_last_links()
+        return
+
+    if mode == "manage_nodes":
+        if last_state is None:
+            exit_error("No last deployment detected; cannot manage deployed nodes")
+        manage_deployed_nodes_interactive(last_state)
         return
 
     if mode == "uninstall":

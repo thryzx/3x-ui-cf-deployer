@@ -151,6 +151,7 @@ Available modes:
 - Deploy nodes
 - Uninstall
 - Show last subscriptions
+- Manage deployed nodes, only shown when a deployment state exists
 - Fresh install, only shown when x-ui is not installed
 - Show panel access info, only shown when this script installed the panel
 - Show x-ui management commands
@@ -214,6 +215,26 @@ Rollback behavior:
 
 Legacy state files that contain a zone-wide SSL backup trigger a best-effort global SSL restore.
 
+### Manage Deployed Nodes Mode
+
+Use this mode to delete only selected protocols from the last script-managed deployment, for example deleting VMess while keeping VLESS and Trojan.
+
+Behavior:
+
+- List the deployed protocols, ports, and WebSocket paths from `/etc/x-ui/cf_auto_state.json`.
+- Delete only the selected protocol inbounds from 3x-ui.
+- Rebuild managed Cloudflare Origin Rules for the remaining protocols.
+- Resync Cloudflare-only firewall rules so removed protocol ports are no longer kept open.
+- Update `/etc/x-ui/cf_auto_state.json` and `cf_auto_last_links.txt`.
+
+The same action can be run directly:
+
+```bash
+cfd --delete-protocol vmess
+```
+
+Multiple protocols can be comma-separated, for example `cfd --delete-protocol trojan,vmess`.
+
 ### Show Subscriptions Mode
 
 The script first reads `cf_auto_last_links.txt`. If that file is missing, it attempts legacy recovery:
@@ -250,6 +271,9 @@ Protocol flags:
 
 - Enabled protocol: `yes`
 - Disabled protocol: `no`
+- VLESS uses `ev`.
+- Trojan uses `et`.
+- VMess uses `mess`, matching the current byJoey/yx-auto Worker parameter.
 
 The WebSocket path is URL-encoded into the `path` parameter.
 
