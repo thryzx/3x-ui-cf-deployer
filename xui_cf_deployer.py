@@ -849,6 +849,31 @@ def open_firewall_ports_if_active(ports: List[int]) -> None:
         )
 
 
+def close_firewall_ports_if_active(ports: List[int]) -> None:
+    unique_ports = normalize_ports(ports)
+    if not unique_ports:
+        return
+    closed = False
+    if ufw_is_active():
+        for port in unique_ports:
+            run_firewall_command(["ufw", "delete", "allow", f"{port}/tcp"], quiet=True)
+        print(f"Closed broad UFW port rules if present: {', '.join(map(str, unique_ports))}")
+        closed = True
+
+    if firewalld_is_active():
+        for port in unique_ports:
+            run_firewall_command(["firewall-cmd", "--permanent", "--remove-port", f"{port}/tcp"], quiet=True)
+        run_firewall_command(["firewall-cmd", "--reload"], quiet=True)
+        print(f"Closed broad firewalld port rules if present: {', '.join(map(str, unique_ports))}")
+        closed = True
+
+    if not closed:
+        print(
+            "No active UFW/firewalld detected. Broad port cleanup is skipped; "
+            f"review cloud security group rules for: {', '.join(map(str, unique_ports))}/tcp"
+        )
+
+
 def fetch_text_lines(url: str, timeout: int = 10) -> List[str]:
     try:
         with request.urlopen(url, timeout=timeout) as resp:
@@ -3046,20 +3071,29 @@ def delete_inbounds_db(db_path: str, inbound_ids: List[int], tags: List[str]) ->
 
     try:
         cursor = conn.cursor()
-        if inbound_ids:
-            cleanup_v3_clients_for_inbounds(conn, inbound_ids)
-            placeholders = ",".join(["?"] * len(inbound_ids))
-            cursor.execute(f"DELETE FROM inbounds WHERE id IN ({placeholders})", inbound_ids)
-        elif tags:
+        resolved_ids = []
+        for inbound_id in inbound_ids:
+            try:
+                value = int(inbound_id)
+            except (TypeError, ValueError):
+                continue
+            if value not in resolved_ids:
+                resolved_ids.append(value)
+
+        if tags:
             cursor.execute(
                 f"SELECT id FROM inbounds WHERE tag IN ({','.join(['?'] * len(tags))})",
                 tags,
             )
-            resolved_ids = [int(row[0]) for row in cursor.fetchall()]
-            if resolved_ids:
-                cleanup_v3_clients_for_inbounds(conn, resolved_ids)
-            placeholders = ",".join(["?"] * len(tags))
-            cursor.execute(f"DELETE FROM inbounds WHERE tag IN ({placeholders})", tags)
+            for row in cursor.fetchall():
+                value = int(row[0])
+                if value not in resolved_ids:
+                    resolved_ids.append(value)
+
+        if resolved_ids:
+            cleanup_v3_clients_for_inbounds(conn, resolved_ids)
+            placeholders = ",".join(["?"] * len(resolved_ids))
+            cursor.execute(f"DELETE FROM inbounds WHERE id IN ({placeholders})", resolved_ids)
         conn.commit()
     except sqlite3.Error as e:
         print(str(e))
@@ -3566,25 +3600,21 @@ def load_legacy_routes_from_panel(client: XuiPanelClient) -> Dict[str, Any]:
 
 
 def print_last_links() -> None:
-    if os.path.exists(LAST_LINKS_PATH):
-        try:
-            with open(LAST_LINKS_PATH, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-        except OSError as e:
-            exit_error(f"Failed to read last subscriptions: {e}")
-        if content:
-            print(content)
-            return
-
     state = load_last_state()
     if state:
-        links = state.get("links")
-        if isinstance(links, dict):
-            order = state.get("selected_protocols") or PROTOCOL_ORDER
+        routes = state.get("routes")
+        if isinstance(routes, list) and routes:
+            state = refresh_deployment_state_links(state)
+            save_last_state(state)
+            links = state.get("links") if isinstance(state.get("links"), dict) else {}
+            order = state.get("selected_protocols") or [route_protocol(r) for r in routes]
+            order = [str(p).lower() for p in order if str(p).lower() in links]
+            domain = str(state.get("domain", "")).strip()
+            user_uuid = str(state.get("uuid", "")).strip()
+            if domain and user_uuid:
+                save_last_links_snapshot(domain, user_uuid, links, order)
             for protocol in order:
-                p = str(protocol).lower()
-                if p in links:
-                    print(f"{PROTOCOL_LABEL.get(p, p.upper())} subscription {links[p]}")
+                print(f"{PROTOCOL_LABEL.get(protocol, protocol.upper())} subscription {links[protocol]}")
             return
 
         legacy_domain = str(state.get("domain", "")).strip()
@@ -3602,6 +3632,24 @@ def print_last_links() -> None:
             save_last_links_snapshot(legacy_domain, legacy_uuid, links, order)
             for protocol in order:
                 print(f"{PROTOCOL_LABEL.get(protocol, protocol.upper())} subscription {links[protocol]}")
+            return
+        links = state.get("links")
+        if isinstance(links, dict):
+            order = state.get("selected_protocols") or PROTOCOL_ORDER
+            for protocol in order:
+                p = str(protocol).lower()
+                if p in links:
+                    print(f"{PROTOCOL_LABEL.get(p, p.upper())} subscription {links[p]}")
+            return
+
+    if os.path.exists(LAST_LINKS_PATH):
+        try:
+            with open(LAST_LINKS_PATH, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except OSError as e:
+            exit_error(f"Failed to read last subscriptions: {e}")
+        if content:
+            print(content)
             return
 
     if os.path.exists(DB_PATH):
@@ -3711,6 +3759,7 @@ def uninstall_last_config(
             continue
     tags = [str(x) for x in state.get("tags", []) if str(x).strip()]
     delete_managed_inbounds(backend, inbound_ids, tags, panel=panel)
+    close_firewall_ports_if_active(node_ports_from_deployment_state(state))
     sync_cloudflare_origin_firewall_ports([])
 
 
@@ -3747,6 +3796,7 @@ def delete_deployed_protocols(
     if backend == BACKEND_API and not removed_ids:
         exit_error("API mode cannot delete selected protocols because inbound ids are missing from state")
     delete_managed_inbounds(backend, removed_ids, removed_tags, panel=panel)
+    close_firewall_ports_if_active(node_ports_from_deployment_state({"routes": removed.get("routes", [])}))
 
     next_state = refresh_deployment_state_links(next_state)
     save_last_state(next_state)

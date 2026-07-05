@@ -225,6 +225,7 @@ Behavior:
 - Delete only the selected protocol inbounds from 3x-ui.
 - Rebuild managed Cloudflare Origin Rules for the remaining protocols.
 - Resync Cloudflare-only firewall rules so removed protocol ports are no longer kept open.
+- Remove broad UFW/firewalld allow rules for removed protocol ports if old deployments or manual rules created them.
 - Update `/etc/x-ui/cf_auto_state.json` and `cf_auto_last_links.txt`.
 
 The same action can be run directly:
@@ -237,7 +238,7 @@ Multiple protocols can be comma-separated, for example `cfd --delete-protocol tr
 
 ### Show Subscriptions Mode
 
-The script first reads `cf_auto_last_links.txt`. If that file is missing, it attempts legacy recovery:
+If a deployment state exists, the script rebuilds subscription links from `/etc/x-ui/cf_auto_state.json` first and refreshes `cf_auto_last_links.txt`. If no state file exists, it attempts legacy recovery:
 
 - Rebuild from `domain`, `uuid`, and `routes` in the state file.
 - Fallback to reading existing inbounds from SQLite or panel API.
